@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bicep Mog — Singleplayer</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="index.html">← Back to lobby</a>
+
+  <header class="brand">
+    <h1><span class="accent">BICEP</span> <span class="gold">MOG</span></h1>
+    <span class="tag">Singleplayer · Flex On Camera</span>
+  </header>
+
+  <div class="panel">
+    <div class="cam-stage" id="camStage">
+      <video id="video" autoplay playsinline muted></video>
+      <div class="cam-overlay" id="camOverlay">
+        <div class="cam-icon">📷</div>
+        <strong>Camera off</strong>
+        <p>Allow camera access, get in frame, hit the pose.</p>
+      </div>
+      <div class="cam-hud" id="camHud" style="display:none">
+        <div class="rec-dot"></div>
+        <span>LIVE</span>
+      </div>
+      <div class="countdown" id="countdown" style="display:none">3</div>
+    </div>
+
+    <div class="actions">
+      <button class="btn" id="startCam">Start Camera</button>
+      <button class="btn" id="captureBtn" style="display:none">Capture & Rate</button>
+      <button class="btn ghost" id="flipBtn" style="display:none">Flip Camera</button>
+      <button class="btn ghost" id="resetBtn" style="display:none">Retake</button>
+    </div>
+    <p class="hint" id="hint">Tip: good lighting, arm at chest height, palm forward.</p>
+  </div>
+
+  <div class="analysis" id="analysis" style="display:none">
+    <div class="canvas-wrap">
+      <canvas id="canvas"></canvas>
+    </div>
+    <div class="rating-card" id="ratingCard">
+      <div class="rating-label">Verdict</div>
+      <div class="rating-value" id="ratingValue">—</div>
+      <div class="scale" id="scaleBars"></div>
+      <div class="scale-labels" id="scaleLabels"></div>
+      <ul class="points-list" id="pointsList"></ul>
+    </div>
+  </div>
+</div>
+
+<script src="singleplayer.js"></script>
+</body>
+</html>
