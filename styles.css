@@ -272,13 +272,50 @@ h2 {
   border-radius: 14px;
   overflow: hidden;
   border: 1px solid var(--border);
-  min-height: 320px;
+  aspect-ratio: 16 / 10;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.canvas-wrap canvas { display: block; max-width: 100%; height: auto; }
+.canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.canvas-wrap video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.canvas-msg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  color: var(--muted);
+  background: rgba(10,10,12,0.55);
+  z-index: 3;
+  transition: opacity 0.2s;
+}
+.canvas-msg.hint-only {
+  background: linear-gradient(180deg, rgba(10,10,12,0) 60%, rgba(10,10,12,0.55) 100%);
+  justify-content: flex-end;
+  padding-bottom: 18px;
+}
+.canvas-msg strong { color: var(--text); display: block; margin-top: 6px; font-size: 16px; }
+.canvas-msg p { margin: 6px 0 0; font-size: 13px; }
+.canvas-msg .cam-icon { font-size: 44px; opacity: 0.6; }
+.canvas-wrap.tracking .canvas-msg { display: none; }
 
 .canvas-loading {
   position: absolute;

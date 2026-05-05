@@ -22,48 +22,61 @@ const POINT_DEFS = [
   { label: 'Skin tightness',          t: 0.28, perp:  0.12 }
 ];
 
-const camStage   = document.getElementById('camStage');
-const video      = document.getElementById('video');
-const camHud     = document.getElementById('camHud');
-const camOverlay = document.getElementById('camOverlay');
-const countdown  = document.getElementById('countdown');
-const startCam   = document.getElementById('startCam');
-const captureBtn = document.getElementById('captureBtn');
-const flipBtn    = document.getElementById('flipBtn');
-const resetBtn   = document.getElementById('resetBtn');
-const hint       = document.getElementById('hint');
+const DETECT_INTERVAL_MS = 70;
+const SMOOTH_LM = 0.40;
+const SMOOTH_SCORE = 0.18;
+const STALE_AFTER_MS = 600;
 
-const analysisEl  = document.getElementById('analysis');
-const canvas      = document.getElementById('canvas');
-const ctx         = canvas.getContext('2d', { willReadFrequently: true });
+const canvasWrap = document.getElementById('canvasWrap');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const video = document.getElementById('video');
+const canvasMsg = document.getElementById('canvasMsg');
 const canvasLoading = document.getElementById('canvasLoading');
 const loadingText = document.getElementById('loadingText');
-const ratingCard  = document.getElementById('ratingCard');
+const camHud = document.getElementById('camHud');
+
+const startCam = document.getElementById('startCam');
+const flipBtn = document.getElementById('flipBtn');
+const stopBtn = document.getElementById('stopBtn');
+const hint = document.getElementById('hint');
+
+const ratingCard = document.getElementById('ratingCard');
 const ratingValue = document.getElementById('ratingValue');
-const scaleBars   = document.getElementById('scaleBars');
+const scaleBars = document.getElementById('scaleBars');
 const scaleLabels = document.getElementById('scaleLabels');
-const pointsList  = document.getElementById('pointsList');
+const pointsList = document.getElementById('pointsList');
 
 let stream = null;
 let facingMode = 'user';
-let capturedImage = null;
 let poseLandmarker = null;
 let posePromise = null;
+let running = false;
+let rafId = null;
+let lastDetectTs = -1;
+let lastTrackedTs = 0;
 
-startCam.addEventListener('click', () => {
-  startCamera();
+let stateArm = null;
+let stateScores = null;
+let statePoints = null;
+let displayedTier = -1;
+
+initScale();
+
+startCam.addEventListener('click', async () => {
   loadPose();
+  await startCamera();
+  startLoop();
 });
-flipBtn.addEventListener('click', () => {
+flipBtn.addEventListener('click', async () => {
   facingMode = facingMode === 'user' ? 'environment' : 'user';
-  startCamera();
+  await startCamera();
 });
-captureBtn.addEventListener('click', () => runCountdownAndCapture());
-resetBtn.addEventListener('click', () => resetAll());
+stopBtn.addEventListener('click', () => stopAll());
 
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
-    showCamError('Camera API not available in this browser.');
+    showMsg('Camera API not available', 'Try a different browser.');
     return;
   }
   try {
@@ -74,191 +87,203 @@ async function startCamera() {
     });
     video.srcObject = stream;
     await video.play();
-    camStage.classList.add('live');
-    camStage.classList.remove('error');
-    camHud.style.display = 'flex';
+    sizeCanvasToVideo();
     startCam.style.display = 'none';
-    captureBtn.style.display = 'inline-block';
     flipBtn.style.display = 'inline-block';
-    hint.textContent = 'When you\'re ready, hit Capture & Rate. 3-second timer gives you time to pose.';
+    stopBtn.style.display = 'inline-block';
+    camHud.style.display = 'flex';
+    showMsg('Step into frame', 'We need your shoulder, elbow, and wrist visible.', true);
+    hint.textContent = 'Live tracking active. Move closer / further until points lock onto your arm.';
   } catch (err) {
-    showCamError(err.name === 'NotAllowedError'
-      ? 'Camera blocked. Allow camera access in your browser to continue.'
-      : 'Couldn\'t start camera: ' + err.message);
+    showMsg(
+      err.name === 'NotAllowedError' ? 'Camera blocked' : 'Camera error',
+      err.name === 'NotAllowedError' ? 'Allow camera access in your browser to continue.' : err.message
+    );
   }
 }
 
-function showCamError(msg) {
-  camStage.classList.add('error');
-  camStage.classList.remove('live');
-  camOverlay.querySelector('strong').textContent = msg;
-  camOverlay.querySelector('p').textContent = 'Try again, or check your browser camera permissions.';
-  camHud.style.display = 'none';
+function sizeCanvasToVideo() {
+  const vw = video.videoWidth || 1280;
+  const vh = video.videoHeight || 720;
+  const targetW = Math.min(720, vw);
+  const ratio = targetW / vw;
+  canvas.width = Math.round(vw * ratio);
+  canvas.height = Math.round(vh * ratio);
 }
 
-function runCountdownAndCapture() {
-  let n = 3;
-  countdown.style.display = 'flex';
-  countdown.textContent = n;
-  captureBtn.disabled = true;
-  flipBtn.disabled = true;
-  const timer = setInterval(() => {
-    n -= 1;
-    if (n > 0) {
-      countdown.textContent = n;
-      countdown.animate(
-        [{ transform: 'scale(0.6)', opacity: 0 }, { transform: 'scale(1)', opacity: 1 }],
-        { duration: 220, easing: 'ease-out' }
-      );
-    } else {
-      clearInterval(timer);
-      countdown.textContent = 'FLEX';
-      setTimeout(() => {
-        countdown.style.display = 'none';
-        captureBtn.disabled = false;
-        flipBtn.disabled = false;
-        capture();
-      }, 350);
-    }
-  }, 800);
+function showMsg(title, body, hintOnly = false) {
+  canvasMsg.style.display = 'flex';
+  canvasMsg.classList.toggle('hint-only', hintOnly);
+  canvasMsg.querySelector('strong').textContent = title;
+  canvasMsg.querySelector('p').textContent = body;
+  canvasMsg.querySelector('.cam-icon').style.display = hintOnly ? 'none' : 'block';
 }
 
-function capture() {
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (!w || !h) return;
-  const off = document.createElement('canvas');
-  off.width = w; off.height = h;
-  const octx = off.getContext('2d');
-  octx.translate(w, 0);
-  octx.scale(-1, 1);
-  octx.drawImage(video, 0, 0, w, h);
-
-  const img = new Image();
-  img.onload = () => {
-    capturedImage = img;
-    stopCamera();
-    analysisEl.style.display = 'grid';
-    resetBtn.style.display = 'inline-block';
-    captureBtn.style.display = 'none';
-    flipBtn.style.display = 'none';
-    drawAnalysis(img);
-    analysisEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-  img.src = off.toDataURL('image/jpeg', 0.92);
+function hideMsg() {
+  canvasMsg.style.display = 'none';
 }
 
-function stopCamera() {
+function stopAll() {
+  running = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
     stream = null;
   }
-  camStage.classList.remove('live');
-  camHud.style.display = 'none';
-}
-
-function resetAll() {
-  capturedImage = null;
-  analysisEl.style.display = 'none';
-  resetBtn.style.display = 'none';
+  video.srcObject = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   startCam.style.display = 'inline-block';
-  camOverlay.querySelector('strong').textContent = 'Camera off';
-  camOverlay.querySelector('p').textContent = 'Allow camera access, get in frame, hit the pose.';
-  camStage.classList.remove('error');
-  hint.textContent = 'Tip: good lighting, arm at chest height, palm forward.';
+  flipBtn.style.display = 'none';
+  stopBtn.style.display = 'none';
+  camHud.style.display = 'none';
+  canvasWrap.classList.remove('tracking');
+  showMsg('Camera off', 'Tap Start Camera to flex live.');
+  resetState();
+  ratingValue.textContent = '—';
+  ratingCard.className = 'rating-card';
+  initScale();
+  pointsList.innerHTML = `<li style="border-top:none"><div style="flex:1; color:var(--muted); font-size:13px;">Start the camera and step into frame. Your rating updates in real time.</div></li>`;
+  hint.textContent = 'Tip: good lighting, full arm visible. Tracker auto-locks on the more flexed arm.';
+  displayedTier = -1;
 }
 
-window.addEventListener('beforeunload', stopCamera);
+function resetState() {
+  stateArm = null;
+  stateScores = null;
+  statePoints = null;
+  lastTrackedTs = 0;
+}
+
+window.addEventListener('beforeunload', stopAll);
 
 async function loadPose() {
   if (poseLandmarker) return poseLandmarker;
   if (posePromise) return posePromise;
+  canvasLoading.style.display = 'flex';
+  loadingText.textContent = 'Loading pose model…';
   posePromise = (async () => {
     const vision = await import(MP_MODULE);
     const fileset = await vision.FilesetResolver.forVisionTasks(MP_WASM);
+    const opts = (delegate) => ({
+      baseOptions: { modelAssetPath: POSE_MODEL, delegate },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.4,
+      minPosePresenceConfidence: 0.4,
+      minTrackingConfidence: 0.4
+    });
     try {
-      poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: POSE_MODEL, delegate: 'GPU' },
-        runningMode: 'IMAGE',
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.4,
-        minPosePresenceConfidence: 0.4,
-        minTrackingConfidence: 0.4
-      });
+      poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, opts('GPU'));
     } catch {
-      poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: POSE_MODEL, delegate: 'CPU' },
-        runningMode: 'IMAGE',
-        numPoses: 1
-      });
+      poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, opts('CPU'));
     }
     return poseLandmarker;
   })();
-  return posePromise;
+  try {
+    await posePromise;
+  } finally {
+    canvasLoading.style.display = 'none';
+  }
+  return poseLandmarker;
 }
 
-async function drawAnalysis(img) {
-  const maxW = 720;
-  const ratio = img.width > maxW ? maxW / img.width : 1;
-  const w = Math.round(img.width * ratio);
-  const h = Math.round(img.height * ratio);
-  canvas.width = w;
-  canvas.height = h;
-  ctx.drawImage(img, 0, 0, w, h);
+function startLoop() {
+  if (running) return;
+  running = true;
+  loop();
+}
 
-  canvasLoading.style.display = 'flex';
-  loadingText.textContent = poseLandmarker ? 'Detecting your arm…' : 'Loading pose model…';
-  ratingValue.textContent = '…';
-  scaleBars.innerHTML = '';
-  scaleLabels.innerHTML = '';
-  pointsList.innerHTML = '';
+function loop() {
+  if (!running) return;
+  rafId = requestAnimationFrame(loop);
 
-  let detector;
-  try {
-    detector = await loadPose();
-  } catch (err) {
-    canvasLoading.style.display = 'none';
-    renderNoArm('Couldn\'t load the pose detector. Check your connection and try again.');
-    return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+
+  if (canvas.width === 0 || Math.abs(canvas.width / canvas.height - vw / vh) > 0.01) {
+    sizeCanvasToVideo();
   }
 
-  loadingText.textContent = 'Detecting your arm…';
-  await new Promise(r => requestAnimationFrame(r));
+  const w = canvas.width, h = canvas.height;
 
-  let result;
-  try {
-    result = detector.detect(canvas);
-  } catch (err) {
-    canvasLoading.style.display = 'none';
-    renderNoArm('Detection failed. Try retaking the photo.');
-    return;
+  ctx.save();
+  ctx.translate(w, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, w, h);
+  ctx.restore();
+
+  const now = performance.now();
+  if (poseLandmarker && now - lastDetectTs > DETECT_INTERVAL_MS) {
+    lastDetectTs = now;
+    try {
+      const result = poseLandmarker.detectForVideo(video, now);
+      handleDetection(result, w, h, now);
+    } catch (e) {
+      console.warn('detection error', e);
+    }
   }
 
-  canvasLoading.style.display = 'none';
+  if (statePoints) {
+    drawOverlayPoints(statePoints);
+  }
 
+  if (lastTrackedTs && performance.now() - lastTrackedTs > STALE_AFTER_MS) {
+    if (statePoints || stateArm) {
+      resetState();
+      canvasWrap.classList.remove('tracking');
+      showMsg('Lost track', 'Get your arm back in frame.', true);
+      ratingValue.textContent = '—';
+      ratingCard.className = 'rating-card';
+      pointsList.innerHTML = `<li style="border-top:none"><div style="flex:1; color:var(--muted); font-size:13px;">No arm detected. Adjust position or lighting.</div></li>`;
+      initScale();
+      displayedTier = -1;
+    }
+  }
+}
+
+function handleDetection(result, w, h, now) {
   if (!result.landmarks || result.landmarks.length === 0) {
-    renderNoArm('Couldn\'t see a person in frame. Make sure your shoulder, elbow, and wrist are all visible.');
     return;
   }
+  const mirrored = mirrorLandmarks(result.landmarks[0]);
+  const arm = pickFlexedArm(mirrored);
+  if (!arm) return;
 
-  const arm = pickFlexedArm(result.landmarks[0]);
-  if (!arm) {
-    renderNoArm('Couldn\'t lock onto your arm. Get your shoulder, elbow, and wrist all in the shot, with good light.');
-    return;
+  if (!stateArm) {
+    stateArm = cloneArm(arm);
+  } else {
+    lerpArmInPlace(stateArm, arm, SMOOTH_LM);
+  }
+  stateArm.elbowAngle = elbowAngle(stateArm.s, stateArm.e, stateArm.w);
+
+  const pts = placePointsOnArm(stateArm, w, h);
+  const sc = scorePoints(pts, stateArm, w, h);
+
+  if (!stateScores) {
+    stateScores = sc.slice();
+  } else {
+    for (let i = 0; i < sc.length; i++) {
+      stateScores[i] += (sc[i] - stateScores[i]) * SMOOTH_SCORE;
+    }
   }
 
-  const points = placePointsOnArm(arm, w, h);
-  const scores = scorePoints(points, arm, w, h);
-  points.forEach((p, i) => p.score = scores[i]);
-  const overall = scores.reduce((a, b) => a + b, 0) / scores.length;
+  pts.forEach((p, i) => p.score = Math.round(stateScores[i]));
+  statePoints = pts;
+  lastTrackedTs = now;
+  canvasWrap.classList.add('tracking');
+  hideMsg();
 
-  drawOverlay(points);
-  renderRating(overall, points);
+  updateSidebar(pts);
+}
+
+function mirrorLandmarks(lm) {
+  return lm.map(p => ({ x: 1 - p.x, y: p.y, z: p.z, visibility: p.visibility }));
 }
 
 function pickFlexedArm(lm) {
-  const left  = { s: lm[11], e: lm[13], w: lm[15], side: 'left'  };
-  const right = { s: lm[12], e: lm[14], w: lm[16], side: 'right' };
+  const left  = { s: lm[12], e: lm[14], w: lm[16] };
+  const right = { s: lm[11], e: lm[13], w: lm[15] };
 
   function rate(arm) {
     const v = (arm.s.visibility + arm.e.visibility + arm.w.visibility) / 3;
@@ -270,9 +295,23 @@ function pickFlexedArm(lm) {
   const lr = rate(left);
   const rr = rate(right);
   if (lr === -Infinity && rr === -Infinity) return null;
-  const winner = lr >= rr ? left : right;
-  winner.elbowAngle = elbowAngle(winner.s, winner.e, winner.w);
-  return winner;
+  return lr >= rr ? left : right;
+}
+
+function cloneArm(a) {
+  return {
+    s: { ...a.s },
+    e: { ...a.e },
+    w: { ...a.w }
+  };
+}
+
+function lerpArmInPlace(target, src, alpha) {
+  for (const k of ['s', 'e', 'w']) {
+    target[k].x += (src[k].x - target[k].x) * alpha;
+    target[k].y += (src[k].y - target[k].y) * alpha;
+    target[k].visibility = src[k].visibility;
+  }
 }
 
 function elbowAngle(s, e, w) {
@@ -292,6 +331,7 @@ function placePointsOnArm(arm, w, h) {
 
   const dx = ex - sx, dy = ey - sy;
   const len = Math.hypot(dx, dy);
+  if (len < 1) return [];
   const ux = dx / len, uy = dy / len;
   let nx = -uy, ny = ux;
 
@@ -308,24 +348,23 @@ function placePointsOnArm(arm, w, h) {
 
 function scorePoints(points, arm, w, h) {
   const upperLen = Math.hypot((arm.e.x - arm.s.x) * w, (arm.e.y - arm.s.y) * h);
-  const radius = Math.max(10, upperLen * 0.10);
+  const radius = Math.max(8, upperLen * 0.10);
 
-  const baseStds = points.map(p => sampleStd(p.x, p.y, radius));
-  const globalAvg = baseStds.reduce((a, b) => a + b, 0) / baseStds.length;
+  const stds = points.map(p => sampleStd(p.x, p.y, radius));
+  const globalAvg = stds.reduce((a, b) => a + b, 0) / Math.max(1, stds.length);
 
   const flexBonus = Math.max(0, (180 - arm.elbowAngle)) * 0.25;
-
   const forearmLen = Math.hypot((arm.w.x - arm.e.x) * w, (arm.w.y - arm.e.y) * h);
   const insertionRatio = forearmLen / Math.max(1, upperLen);
   const insertionScore = Math.min(95, 35 + insertionRatio * 35);
 
   return points.map((p, i) => {
-    const local = baseStds[i];
+    const local = stds[i];
     let s = 25 + local * 1.6;
     if (i === 0) s += flexBonus * 0.6;
     if (i === 4) s = (s + insertionScore) / 2;
     s += (local - globalAvg) * 0.6;
-    return Math.round(Math.max(12, Math.min(98, s)));
+    return Math.max(12, Math.min(98, s));
   });
 }
 
@@ -337,7 +376,7 @@ function sampleStd(cx, cy, radius) {
   if (ww < 4 || hh < 4) return 15;
   const data = ctx.getImageData(x0, y0, ww, hh).data;
   let sum = 0, sumSq = 0, n = 0;
-  for (let i = 0; i < data.length; i += 4) {
+  for (let i = 0; i < data.length; i += 8) {
     const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
     sum += lum; sumSq += lum * lum; n++;
   }
@@ -346,9 +385,8 @@ function sampleStd(cx, cy, radius) {
   return Math.sqrt(variance);
 }
 
-function drawOverlay(points) {
+function drawOverlayPoints(points) {
   const w = canvas.width, h = canvas.height;
-  ctx.drawImage(capturedImage, 0, 0, w, h);
 
   ctx.save();
   ctx.strokeStyle = 'rgba(255, 59, 48, 0.55)';
@@ -419,56 +457,63 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function renderRating(overall, points) {
-  const idx = Math.min(TIERS.length - 1, Math.max(0, Math.floor(overall / (100 / TIERS.length))));
-  const tier = TIERS[idx];
-
-  ratingValue.textContent = tier.name;
-  ratingCard.className = 'rating-card tier-' + tier.key;
-
+function initScale() {
   scaleBars.innerHTML = '';
   scaleLabels.innerHTML = '';
-  TIERS.forEach((t, i) => {
+  TIERS.forEach((t) => {
     const bar = document.createElement('div');
-    bar.className = 'step' + (i <= idx ? ' on' : '');
+    bar.className = 'step';
     scaleBars.appendChild(bar);
     const lbl = document.createElement('span');
     lbl.textContent = t.name;
-    if (i === idx) lbl.className = 'active';
     scaleLabels.appendChild(lbl);
-  });
-
-  pointsList.innerHTML = '';
-  const intro = document.createElement('li');
-  intro.innerHTML = `<div style="flex:1"><div class="label">${tier.desc}</div><div class="score">Composite score: ${Math.round(overall)} / 100</div></div>`;
-  intro.style.borderTop = 'none';
-  pointsList.appendChild(intro);
-
-  points.forEach((p, i) => {
-    const li = document.createElement('li');
-    li.innerHTML = `
-      <div class="num">${i + 1}</div>
-      <div style="flex:1">
-        <div class="label">${p.label}</div>
-        <div class="score">${p.score} / 100 · ${verdictFor(p.score)}</div>
-      </div>
-    `;
-    pointsList.appendChild(li);
   });
 }
 
-function renderNoArm(msg) {
-  ratingValue.textContent = '—';
-  scaleBars.innerHTML = '';
-  scaleLabels.innerHTML = '';
-  pointsList.innerHTML = `
-    <li class="error-state" style="border-top:none">
-      <div style="flex:1">
-        <strong>No arm detected</strong>
-        ${msg}
-      </div>
-    </li>`;
-  ctx.drawImage(capturedImage, 0, 0, canvas.width, canvas.height);
+function updateSidebar(points) {
+  const overall = stateScores.reduce((a, b) => a + b, 0) / stateScores.length;
+  const idx = Math.min(TIERS.length - 1, Math.max(0, Math.floor(overall / (100 / TIERS.length))));
+  const tier = TIERS[idx];
+
+  if (idx !== displayedTier) {
+    ratingValue.textContent = tier.name;
+    ratingCard.className = 'rating-card tier-' + tier.key;
+    Array.from(scaleBars.children).forEach((bar, i) => {
+      bar.classList.toggle('on', i <= idx);
+    });
+    Array.from(scaleLabels.children).forEach((lbl, i) => {
+      lbl.classList.toggle('active', i === idx);
+    });
+    displayedTier = idx;
+  }
+
+  const liNodes = pointsList.children;
+  const expectedRows = points.length + 1;
+  if (liNodes.length !== expectedRows) {
+    pointsList.innerHTML = '';
+    const intro = document.createElement('li');
+    intro.style.borderTop = 'none';
+    intro.innerHTML = `<div style="flex:1"><div class="label" id="tierDesc"></div><div class="score" id="compositeScore"></div></div>`;
+    pointsList.appendChild(intro);
+    points.forEach((p, i) => {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <div class="num">${i + 1}</div>
+        <div style="flex:1">
+          <div class="label">${p.label}</div>
+          <div class="score" data-score="${i}"></div>
+        </div>
+      `;
+      pointsList.appendChild(li);
+    });
+  }
+
+  document.getElementById('tierDesc').textContent = tier.desc;
+  document.getElementById('compositeScore').textContent = `Composite: ${Math.round(overall)} / 100`;
+  points.forEach((p, i) => {
+    const el = pointsList.querySelector(`[data-score="${i}"]`);
+    if (el) el.textContent = `${p.score} / 100 · ${verdictFor(p.score)}`;
+  });
 }
 
 function verdictFor(s) {
