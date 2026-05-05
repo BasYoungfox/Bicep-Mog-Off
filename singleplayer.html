@@ -32,6 +32,19 @@
         <div class="rec-dot"></div>
         <span>LIVE</span>
       </div>
+
+      <div class="rating-timer" id="ratingTimer" style="display:none">
+        <div class="timer-ring">
+          <svg viewBox="0 0 40 40">
+            <circle class="ring-bg" cx="20" cy="20" r="16"></circle>
+            <circle class="ring-fill" id="ringFill" cx="20" cy="20" r="16"></circle>
+          </svg>
+          <div class="timer-num" id="timerNum">5</div>
+        </div>
+        <span class="timer-label">RATING</span>
+      </div>
+
+      <div class="final-stamp" id="finalStamp" style="display:none">FINAL</div>
     </div>
 
     <div class="rating-card" id="ratingCard">
@@ -51,6 +64,8 @@
 
   <div class="actions" style="margin-top: 16px;">
     <button class="btn" id="startCam">Start Camera</button>
+    <button class="btn" id="rateBtn" style="display:none">Start 5s Rating</button>
+    <button class="btn" id="rateAgainBtn" style="display:none">Rate Again</button>
     <button class="btn ghost" id="flipBtn" style="display:none">Flip Camera</button>
     <button class="btn ghost" id="stopBtn" style="display:none">Stop</button>
   </div>

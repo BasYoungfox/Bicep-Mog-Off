@@ -26,6 +26,8 @@ const DETECT_INTERVAL_MS = 70;
 const SMOOTH_LM = 0.40;
 const SMOOTH_SCORE = 0.18;
 const STALE_AFTER_MS = 600;
+const RATING_DURATION_MS = 5000;
+const RING_CIRC = 100.531;
 
 const canvasWrap = document.getElementById('canvasWrap');
 const canvas = document.getElementById('canvas');
@@ -39,6 +41,13 @@ const camHud = document.getElementById('camHud');
 const startCam = document.getElementById('startCam');
 const flipBtn = document.getElementById('flipBtn');
 const stopBtn = document.getElementById('stopBtn');
+const rateBtn = document.getElementById('rateBtn');
+const rateAgainBtn = document.getElementById('rateAgainBtn');
+const ratingTimer = document.getElementById('ratingTimer');
+const ringFill = document.getElementById('ringFill');
+const timerNum = document.getElementById('timerNum');
+const finalStamp = document.getElementById('finalStamp');
+const ratingLabelEl = document.querySelector('.rating-label');
 const hint = document.getElementById('hint');
 
 const ratingCard = document.getElementById('ratingCard');
@@ -61,11 +70,17 @@ let stateScores = null;
 let statePoints = null;
 let displayedTier = -1;
 
+let mode = 'idle';
+let ratingSamples = [];
+let ratingStartTs = 0;
+let timerRafId = null;
+
 initScale();
 
 startCam.addEventListener('click', async () => {
   loadPose();
   await startCamera();
+  setMode('live');
   startLoop();
 });
 flipBtn.addEventListener('click', async () => {
@@ -73,6 +88,115 @@ flipBtn.addEventListener('click', async () => {
   await startCamera();
 });
 stopBtn.addEventListener('click', () => stopAll());
+rateBtn.addEventListener('click', () => startRating());
+rateAgainBtn.addEventListener('click', () => returnToLive());
+
+function setMode(next) {
+  mode = next;
+  startCam.style.display   = next === 'idle'    ? 'inline-block' : 'none';
+  rateBtn.style.display    = next === 'live'    ? 'inline-block' : 'none';
+  rateAgainBtn.style.display = next === 'verdict' ? 'inline-block' : 'none';
+  flipBtn.style.display    = (next === 'live')                   ? 'inline-block' : 'none';
+  stopBtn.style.display    = (next !== 'idle')                   ? 'inline-block' : 'none';
+
+  if (next === 'rating') {
+    ratingTimer.style.display = 'flex';
+    ringFill.style.strokeDashoffset = '0';
+    timerNum.textContent = '5';
+    finalStamp.style.display = 'none';
+    ratingLabelEl.textContent = 'Rating in progress';
+    hint.textContent = 'Hold the pose. Sampling for 5 seconds…';
+  } else if (next === 'verdict') {
+    ratingTimer.style.display = 'none';
+    finalStamp.style.display = 'block';
+    finalStamp.style.animation = 'none';
+    void finalStamp.offsetWidth;
+    finalStamp.style.animation = '';
+    ratingLabelEl.textContent = 'Final Verdict';
+    hint.textContent = 'Frozen. Hit Rate Again for another 5-second session.';
+  } else if (next === 'live') {
+    ratingTimer.style.display = 'none';
+    finalStamp.style.display = 'none';
+    ratingLabelEl.textContent = 'Live Verdict';
+    hint.textContent = 'Live tracking active. When you\'re ready, hit Start 5s Rating.';
+  } else {
+    ratingTimer.style.display = 'none';
+    finalStamp.style.display = 'none';
+    ratingLabelEl.textContent = 'Live Verdict';
+  }
+}
+
+function startRating() {
+  if (mode !== 'live') return;
+  if (!stateArm) {
+    showMsg('Get into frame first', 'Lock onto your arm before starting.', true);
+    return;
+  }
+  ratingSamples = [];
+  ratingStartTs = performance.now();
+  setMode('rating');
+  tickTimer();
+}
+
+function tickTimer() {
+  if (mode !== 'rating') return;
+  const elapsed = performance.now() - ratingStartTs;
+  const remaining = Math.max(0, RATING_DURATION_MS - elapsed);
+  const frac = remaining / RATING_DURATION_MS;
+  ringFill.style.strokeDashoffset = String((1 - frac) * RING_CIRC);
+  timerNum.textContent = String(Math.max(1, Math.ceil(remaining / 1000)));
+  if (remaining <= 0) {
+    finalizeRating();
+    return;
+  }
+  timerRafId = requestAnimationFrame(tickTimer);
+}
+
+function finalizeRating() {
+  if (timerRafId) cancelAnimationFrame(timerRafId);
+  timerRafId = null;
+
+  if (!ratingSamples.length || !statePoints) {
+    setMode('live');
+    showMsg('No samples', 'Couldn\'t track your arm during the session. Try again.', true);
+    return;
+  }
+
+  const n = ratingSamples[0].length;
+  const finalScores = new Array(n).fill(0);
+  for (const s of ratingSamples) {
+    for (let i = 0; i < n; i++) finalScores[i] += s[i];
+  }
+  for (let i = 0; i < n; i++) finalScores[i] /= ratingSamples.length;
+
+  stateScores = finalScores.slice();
+  statePoints.forEach((p, i) => p.score = Math.round(finalScores[i]));
+
+  setMode('verdict');
+  updateSidebar(statePoints);
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      running = false;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      try { video.pause(); } catch {}
+    });
+  });
+}
+
+function returnToLive() {
+  finalStamp.style.display = 'none';
+  resetState();
+  ratingValue.textContent = '—';
+  ratingCard.className = 'rating-card';
+  initScale();
+  pointsList.innerHTML = `<li style="border-top:none"><div style="flex:1; color:var(--muted); font-size:13px;">Get back into frame and hit Start 5s Rating.</div></li>`;
+  displayedTier = -1;
+  try { video.play(); } catch {}
+  setMode('live');
+  startLoop();
+}
 
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -88,12 +212,8 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     sizeCanvasToVideo();
-    startCam.style.display = 'none';
-    flipBtn.style.display = 'inline-block';
-    stopBtn.style.display = 'inline-block';
     camHud.style.display = 'flex';
     showMsg('Step into frame', 'We need your shoulder, elbow, and wrist visible.', true);
-    hint.textContent = 'Live tracking active. Move closer / further until points lock onto your arm.';
   } catch (err) {
     showMsg(
       err.name === 'NotAllowedError' ? 'Camera blocked' : 'Camera error',
@@ -126,26 +246,27 @@ function hideMsg() {
 function stopAll() {
   running = false;
   if (rafId) cancelAnimationFrame(rafId);
+  if (timerRafId) cancelAnimationFrame(timerRafId);
   rafId = null;
+  timerRafId = null;
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
     stream = null;
   }
   video.srcObject = null;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  startCam.style.display = 'inline-block';
-  flipBtn.style.display = 'none';
-  stopBtn.style.display = 'none';
   camHud.style.display = 'none';
   canvasWrap.classList.remove('tracking');
   showMsg('Camera off', 'Tap Start Camera to flex live.');
   resetState();
+  ratingSamples = [];
   ratingValue.textContent = '—';
   ratingCard.className = 'rating-card';
   initScale();
   pointsList.innerHTML = `<li style="border-top:none"><div style="flex:1; color:var(--muted); font-size:13px;">Start the camera and step into frame. Your rating updates in real time.</div></li>`;
   hint.textContent = 'Tip: good lighting, full arm visible. Tracker auto-locks on the more flexed arm.';
   displayedTier = -1;
+  setMode('idle');
 }
 
 function resetState() {
@@ -228,7 +349,7 @@ function loop() {
     drawOverlayPoints(statePoints);
   }
 
-  if (lastTrackedTs && performance.now() - lastTrackedTs > STALE_AFTER_MS) {
+  if (mode !== 'verdict' && lastTrackedTs && performance.now() - lastTrackedTs > STALE_AFTER_MS) {
     if (statePoints || stateArm) {
       resetState();
       canvasWrap.classList.remove('tracking');
@@ -273,6 +394,10 @@ function handleDetection(result, w, h, now) {
   lastTrackedTs = now;
   canvasWrap.classList.add('tracking');
   hideMsg();
+
+  if (mode === 'rating') {
+    ratingSamples.push(sc.slice());
+  }
 
   updateSidebar(pts);
 }
