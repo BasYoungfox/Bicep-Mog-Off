@@ -1,3 +1,8 @@
+const MP_VERSION = '0.10.14';
+const MP_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
+const MP_MODULE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`;
+const POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
 const TIERS = [
   { key: 'sub3',     name: 'Sub-3',    desc: 'Skin and bone. The arm is still loading.' },
   { key: 'sub5',     name: 'Sub-5',    desc: 'Awareness unlocked. The journey begins.' },
@@ -8,40 +13,47 @@ const TIERS = [
   { key: 'chadlite', name: 'CHADLITE', desc: 'Borderline mythical. Mogs in real time.' }
 ];
 
-const POINT_TEMPLATES = [
-  { label: 'Peak height',             base: 0.25 },
-  { label: 'Vein definition',         base: 0.15 },
-  { label: 'Belly density',           base: 0.20 },
-  { label: 'Bicep–tricep separation', base: 0.15 },
-  { label: 'Insertion length',        base: 0.15 },
-  { label: 'Skin tightness',          base: 0.10 }
+const POINT_DEFS = [
+  { label: 'Peak height',             t: 0.50, perp:  0.22 },
+  { label: 'Vein definition',         t: 0.40, perp:  0.13 },
+  { label: 'Belly density',           t: 0.50, perp:  0.10 },
+  { label: 'Bicep–tricep separation', t: 0.72, perp:  0.06 },
+  { label: 'Insertion length',        t: 0.88, perp:  0.10 },
+  { label: 'Skin tightness',          t: 0.28, perp:  0.12 }
 ];
 
-const camStage  = document.getElementById('camStage');
-const video     = document.getElementById('video');
-const camHud    = document.getElementById('camHud');
+const camStage   = document.getElementById('camStage');
+const video      = document.getElementById('video');
+const camHud     = document.getElementById('camHud');
 const camOverlay = document.getElementById('camOverlay');
-const countdown = document.getElementById('countdown');
-const startCam  = document.getElementById('startCam');
-const captureBtn= document.getElementById('captureBtn');
-const flipBtn   = document.getElementById('flipBtn');
-const resetBtn  = document.getElementById('resetBtn');
-const hint      = document.getElementById('hint');
+const countdown  = document.getElementById('countdown');
+const startCam   = document.getElementById('startCam');
+const captureBtn = document.getElementById('captureBtn');
+const flipBtn    = document.getElementById('flipBtn');
+const resetBtn   = document.getElementById('resetBtn');
+const hint       = document.getElementById('hint');
 
-const analysisEl = document.getElementById('analysis');
-const canvas     = document.getElementById('canvas');
-const ctx        = canvas.getContext('2d');
-const ratingCard = document.getElementById('ratingCard');
-const ratingValue= document.getElementById('ratingValue');
-const scaleBars  = document.getElementById('scaleBars');
-const scaleLabels= document.getElementById('scaleLabels');
-const pointsList = document.getElementById('pointsList');
+const analysisEl  = document.getElementById('analysis');
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d', { willReadFrequently: true });
+const canvasLoading = document.getElementById('canvasLoading');
+const loadingText = document.getElementById('loadingText');
+const ratingCard  = document.getElementById('ratingCard');
+const ratingValue = document.getElementById('ratingValue');
+const scaleBars   = document.getElementById('scaleBars');
+const scaleLabels = document.getElementById('scaleLabels');
+const pointsList  = document.getElementById('pointsList');
 
 let stream = null;
 let facingMode = 'user';
 let capturedImage = null;
+let poseLandmarker = null;
+let posePromise = null;
 
-startCam.addEventListener('click', () => startCamera());
+startCam.addEventListener('click', () => {
+  startCamera();
+  loadPose();
+});
 flipBtn.addEventListener('click', () => {
   facingMode = facingMode === 'user' ? 'environment' : 'user';
   startCamera();
@@ -158,7 +170,34 @@ function resetAll() {
 
 window.addEventListener('beforeunload', stopCamera);
 
-function drawAnalysis(img) {
+async function loadPose() {
+  if (poseLandmarker) return poseLandmarker;
+  if (posePromise) return posePromise;
+  posePromise = (async () => {
+    const vision = await import(MP_MODULE);
+    const fileset = await vision.FilesetResolver.forVisionTasks(MP_WASM);
+    try {
+      poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: POSE_MODEL, delegate: 'GPU' },
+        runningMode: 'IMAGE',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.4,
+        minPosePresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4
+      });
+    } catch {
+      poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: POSE_MODEL, delegate: 'CPU' },
+        runningMode: 'IMAGE',
+        numPoses: 1
+      });
+    }
+    return poseLandmarker;
+  })();
+  return posePromise;
+}
+
+async function drawAnalysis(img) {
   const maxW = 720;
   const ratio = img.width > maxW ? maxW / img.width : 1;
   const w = Math.round(img.width * ratio);
@@ -167,71 +206,148 @@ function drawAnalysis(img) {
   canvas.height = h;
   ctx.drawImage(img, 0, 0, w, h);
 
-  const pixelScore = computePixelScore(w, h);
-  const points = generatePoints(w, h, pixelScore);
-  const overall = points.reduce((a, p) => a + p.score, 0) / points.length;
+  canvasLoading.style.display = 'flex';
+  loadingText.textContent = poseLandmarker ? 'Detecting your arm…' : 'Loading pose model…';
+  ratingValue.textContent = '…';
+  scaleBars.innerHTML = '';
+  scaleLabels.innerHTML = '';
+  pointsList.innerHTML = '';
+
+  let detector;
+  try {
+    detector = await loadPose();
+  } catch (err) {
+    canvasLoading.style.display = 'none';
+    renderNoArm('Couldn\'t load the pose detector. Check your connection and try again.');
+    return;
+  }
+
+  loadingText.textContent = 'Detecting your arm…';
+  await new Promise(r => requestAnimationFrame(r));
+
+  let result;
+  try {
+    result = detector.detect(canvas);
+  } catch (err) {
+    canvasLoading.style.display = 'none';
+    renderNoArm('Detection failed. Try retaking the photo.');
+    return;
+  }
+
+  canvasLoading.style.display = 'none';
+
+  if (!result.landmarks || result.landmarks.length === 0) {
+    renderNoArm('Couldn\'t see a person in frame. Make sure your shoulder, elbow, and wrist are all visible.');
+    return;
+  }
+
+  const arm = pickFlexedArm(result.landmarks[0]);
+  if (!arm) {
+    renderNoArm('Couldn\'t lock onto your arm. Get your shoulder, elbow, and wrist all in the shot, with good light.');
+    return;
+  }
+
+  const points = placePointsOnArm(arm, w, h);
+  const scores = scorePoints(points, arm, w, h);
+  points.forEach((p, i) => p.score = scores[i]);
+  const overall = scores.reduce((a, b) => a + b, 0) / scores.length;
 
   drawOverlay(points);
   renderRating(overall, points);
 }
 
-function computePixelScore(w, h) {
-  const data = ctx.getImageData(0, 0, w, h).data;
-  let sum = 0, contrast = 0, prev = 0;
-  const step = 4 * 16;
-  for (let i = 0; i < data.length; i += step) {
-    const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-    sum += lum;
-    contrast += Math.abs(lum - prev);
-    prev = lum;
+function pickFlexedArm(lm) {
+  const left  = { s: lm[11], e: lm[13], w: lm[15], side: 'left'  };
+  const right = { s: lm[12], e: lm[14], w: lm[16], side: 'right' };
+
+  function rate(arm) {
+    const v = (arm.s.visibility + arm.e.visibility + arm.w.visibility) / 3;
+    if (v < 0.45) return -Infinity;
+    const angle = elbowAngle(arm.s, arm.e, arm.w);
+    return v * 100 + (180 - angle);
   }
-  const samples = data.length / step;
-  const avg = sum / samples;
-  const contrastAvg = contrast / samples;
-  return Math.min(100, (contrastAvg * 1.4) + (avg > 60 && avg < 200 ? 20 : 5));
+
+  const lr = rate(left);
+  const rr = rate(right);
+  if (lr === -Infinity && rr === -Infinity) return null;
+  const winner = lr >= rr ? left : right;
+  winner.elbowAngle = elbowAngle(winner.s, winner.e, winner.w);
+  return winner;
 }
 
-function generatePoints(w, h, pixelScore) {
-  const seed = Math.floor(pixelScore * 1000) + Date.now() % 10000;
-  const rand = mulberry32(seed);
+function elbowAngle(s, e, w) {
+  const v1x = s.x - e.x, v1y = s.y - e.y;
+  const v2x = w.x - e.x, v2y = w.y - e.y;
+  const dot = v1x * v2x + v1y * v2y;
+  const m1 = Math.hypot(v1x, v1y);
+  const m2 = Math.hypot(v2x, v2y);
+  if (m1 === 0 || m2 === 0) return 180;
+  return Math.acos(Math.max(-1, Math.min(1, dot / (m1 * m2)))) * 180 / Math.PI;
+}
 
-  const anchors = [
-    { x: 0.42, y: 0.30 },
-    { x: 0.55, y: 0.42 },
-    { x: 0.50, y: 0.58 },
-    { x: 0.38, y: 0.55 },
-    { x: 0.62, y: 0.30 },
-    { x: 0.48, y: 0.72 }
-  ];
+function placePointsOnArm(arm, w, h) {
+  const sx = arm.s.x * w, sy = arm.s.y * h;
+  const ex = arm.e.x * w, ey = arm.e.y * h;
+  const wx = arm.w.x * w, wy = arm.w.y * h;
 
-  return POINT_TEMPLATES.map((tpl, i) => {
-    const drift = pixelScore * 0.5 + (rand() - 0.5) * 30;
-    const score = Math.max(10, Math.min(98, drift + (rand() * 25)));
-    const a = anchors[i];
-    const x = a.x * w + (rand() - 0.5) * w * 0.06;
-    const y = a.y * h + (rand() - 0.5) * h * 0.06;
-    return { ...tpl, x, y, score: Math.round(score) };
+  const dx = ex - sx, dy = ey - sy;
+  const len = Math.hypot(dx, dy);
+  const ux = dx / len, uy = dy / len;
+  let nx = -uy, ny = ux;
+
+  const wpx = wx - ex, wpy = wy - ey;
+  const dotN = wpx * nx + wpy * ny;
+  if (dotN < 0) { nx = -nx; ny = -ny; }
+
+  return POINT_DEFS.map(def => {
+    const x = sx + ux * len * def.t + nx * len * def.perp;
+    const y = sy + uy * len * def.t + ny * len * def.perp;
+    return { label: def.label, x, y };
   });
 }
 
-function mulberry32(a) {
-  return function() {
-    a |= 0; a = a + 0x6D2B79F5 | 0;
-    let t = a;
-    t = Math.imul(t ^ t >>> 15, t | 1);
-    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
+function scorePoints(points, arm, w, h) {
+  const upperLen = Math.hypot((arm.e.x - arm.s.x) * w, (arm.e.y - arm.s.y) * h);
+  const radius = Math.max(10, upperLen * 0.10);
+
+  const baseStds = points.map(p => sampleStd(p.x, p.y, radius));
+  const globalAvg = baseStds.reduce((a, b) => a + b, 0) / baseStds.length;
+
+  const flexBonus = Math.max(0, (180 - arm.elbowAngle)) * 0.25;
+
+  const forearmLen = Math.hypot((arm.w.x - arm.e.x) * w, (arm.w.y - arm.e.y) * h);
+  const insertionRatio = forearmLen / Math.max(1, upperLen);
+  const insertionScore = Math.min(95, 35 + insertionRatio * 35);
+
+  return points.map((p, i) => {
+    const local = baseStds[i];
+    let s = 25 + local * 1.6;
+    if (i === 0) s += flexBonus * 0.6;
+    if (i === 4) s = (s + insertionScore) / 2;
+    s += (local - globalAvg) * 0.6;
+    return Math.round(Math.max(12, Math.min(98, s)));
+  });
+}
+
+function sampleStd(cx, cy, radius) {
+  const x0 = Math.max(0, Math.floor(cx - radius));
+  const y0 = Math.max(0, Math.floor(cy - radius));
+  const ww = Math.min(canvas.width - x0, Math.floor(radius * 2));
+  const hh = Math.min(canvas.height - y0, Math.floor(radius * 2));
+  if (ww < 4 || hh < 4) return 15;
+  const data = ctx.getImageData(x0, y0, ww, hh).data;
+  let sum = 0, sumSq = 0, n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+    sum += lum; sumSq += lum * lum; n++;
+  }
+  const mean = sum / n;
+  const variance = Math.max(0, sumSq / n - mean * mean);
+  return Math.sqrt(variance);
 }
 
 function drawOverlay(points) {
   const w = canvas.width, h = canvas.height;
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,0.25)';
-  ctx.fillRect(0, 0, w, h);
-  ctx.restore();
-
   ctx.drawImage(capturedImage, 0, 0, w, h);
 
   ctx.save();
@@ -249,9 +365,9 @@ function drawOverlay(points) {
   ctx.restore();
 
   points.forEach((p, i) => {
-    const labelOffsetX = p.x < w / 2 ? -90 : 30;
+    const labelOffsetX = p.x < w / 2 ? -100 : 30;
     const labelOffsetY = p.y < h / 2 ? -10 : 20;
-    const lx = Math.max(8, Math.min(w - 150, p.x + labelOffsetX));
+    const lx = Math.max(8, Math.min(w - 160, p.x + labelOffsetX));
     const ly = Math.max(20, Math.min(h - 8, p.y + labelOffsetY));
 
     ctx.save();
@@ -339,6 +455,20 @@ function renderRating(overall, points) {
     `;
     pointsList.appendChild(li);
   });
+}
+
+function renderNoArm(msg) {
+  ratingValue.textContent = '—';
+  scaleBars.innerHTML = '';
+  scaleLabels.innerHTML = '';
+  pointsList.innerHTML = `
+    <li class="error-state" style="border-top:none">
+      <div style="flex:1">
+        <strong>No arm detected</strong>
+        ${msg}
+      </div>
+    </li>`;
+  ctx.drawImage(capturedImage, 0, 0, canvas.width, canvas.height);
 }
 
 function verdictFor(s) {
